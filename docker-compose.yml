@@ -1,0 +1,79 @@
+name: smarthire
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: smarthire_owner
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-owner-change-me}
+      POSTGRES_DB: smarthire
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-local-app-change-me}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U smarthire_owner -d smarthire"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+  migrate:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://smarthire_owner:${POSTGRES_PASSWORD:-local-owner-change-me}@postgres:5432/smarthire
+    command: alembic upgrade head
+    depends_on:
+      postgres:
+        condition: service_healthy
+  api:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://smarthire_app:${APP_DB_PASSWORD:-local-app-change-me}@postgres:5432/smarthire
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    expose: [8000]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+  worker:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://smarthire_app:${APP_DB_PASSWORD:-local-app-change-me}@postgres:5432/smarthire
+      REDIS_URL: redis://redis:6379/0
+    command: celery -A app.tasks.email.celery worker --loglevel=info --concurrency=2
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+  web:
+    build: ./frontend
+    ports: ["8080:8080"]
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  postgres_data:
+  redis_data:
