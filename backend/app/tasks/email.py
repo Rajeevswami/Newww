@@ -1,9 +1,7 @@
 import smtplib
 from email.message import EmailMessage
-from celery import Celery
 from app.core.config import settings
-
-celery = Celery("smarthire", broker=settings.redis_url)
+from app.tasks.celery_app import celery
 
 
 @celery.task(autoretry_for=(OSError,), retry_backoff=True, max_retries=3)

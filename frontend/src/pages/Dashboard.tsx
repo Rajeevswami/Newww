@@ -410,8 +410,9 @@ export default function Dashboard({
             You have{' '}
             <strong>
               {
-                applications.filter((a) => a.match_score >= 90 && !['Hired', 'Rejected'].includes(a.status))
-                  .length
+                applications.filter(
+                  (a) => (a.match_score ?? 0) >= 90 && !['Hired', 'Rejected'].includes(a.status),
+                ).length
               }{' '}
               high-match candidates
             </strong>{' '}

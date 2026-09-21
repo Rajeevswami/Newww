@@ -75,3 +75,28 @@ class ResetInput(TokenInput):
 
 class WorkspaceInput(BaseModel):
     name: str = Field(min_length=2, max_length=100)
+
+
+ALLOWED_API_SCOPES = {
+    "jobs:read",
+    "jobs:write",
+    "candidates:read",
+    "applications:write",
+    "*",
+}
+
+
+class ApiKeyInput(BaseModel):
+    name: str = Field(min_length=2, max_length=80)
+    scopes: list[str] = Field(min_length=1, max_length=20)
+
+    @field_validator("scopes")
+    @classmethod
+    def scopes_valid(cls, scopes):
+        if any(scope not in ALLOWED_API_SCOPES for scope in scopes):
+            raise ValueError("Unknown API key scope")
+        return list(dict.fromkeys(scopes))
+
+
+class PlanInput(BaseModel):
+    plan: Literal["Free", "Pro", "Enterprise"]

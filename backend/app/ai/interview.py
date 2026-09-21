@@ -78,6 +78,57 @@ async def ask_question(state):
     }
 
 
+def _demo_question(state):
+    n = state.get("question_count", 0)
+    skills = state["job_context"]["required_skills"] or ["problem solving"]
+    topic = skills[min(n, len(skills) - 1)]
+    if n == 0:
+        question = (
+            f"Let's start with your experience. Tell me about a project that best demonstrates your fit "
+            f"for the {state['job_context']['title']} role. What was your specific contribution?"
+        )
+    elif state.get("evaluation", {}).get("follow_up"):
+        question = (
+            f"Let's dig a little deeper. Can you give a specific example involving {topic}, "
+            "explain the trade-offs you considered, and tell me how you measured success?"
+        )
+    else:
+        question = [
+            f"How would you approach a challenging {topic} problem when requirements are unclear?",
+            f"Tell me about a time you used {topic} to improve a product. What changed because of your work?",
+            f"How do you validate your decisions when working with {topic}? Walk me through your process.",
+            "Describe a disagreement with a teammate about a technical or design decision. How did you reach a resolution?",
+            "Looking back at your experience, what would you do differently on your next project, and why?",
+        ][n]
+    return question, topic
+
+
+async def stream_ask_question(state, on_token):
+    n = state.get("question_count", 0)
+    skills = state["job_context"]["required_skills"] or ["problem solving"]
+    topic = skills[min(n, len(skills) - 1)]
+    if settings.openai_api_key:
+        from app.ai.provider import stream_chat_tokens
+
+        question = ""
+        async for token in stream_chat_tokens(
+            "Ask exactly one concise adaptive interview question. Use resume gaps and the previous evaluation. Five questions maximum; avoid repeating questions.",
+            state,
+        ):
+            question += token
+            await on_token(token)
+    else:
+        question, topic = _demo_question(state)
+        await on_token(question)
+    return {
+        "question_count": n + 1,
+        "topics_covered": state.get("topics_covered", []) + [topic],
+        "conversation_history": state.get("conversation_history", [])
+        + [{"role": "assistant", "content": question}],
+        "complete": False,
+    }
+
+
 def route_next(state):
     return "generate_scorecard" if state.get("question_count", 0) >= 5 else "ask_question"
 

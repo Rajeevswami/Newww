@@ -23,6 +23,7 @@ export type Job = {
 export type Resume = {
   id: string;
   filename: string;
+  status?: string;
   parsed_json: { name: string; skills: string[]; experience: string[]; education: string[]; summary: string };
   created_at: string;
 };
@@ -33,7 +34,7 @@ export type Application = {
   job_id: string;
   job_title: string;
   department: string;
-  match_score: number;
+  match_score: number | null;
   status: string;
   created_at: string;
   resume: Resume['parsed_json'];
@@ -80,6 +81,9 @@ let accessToken = '';
 let refreshing: Promise<Session> | null = null;
 export function setToken(token: string) {
   accessToken = token;
+}
+export function getToken() {
+  return accessToken;
 }
 export async function api<T = any>(path: string, options: RequestInit = {}, retry = true): Promise<T> {
   const headers: Record<string, string> = {

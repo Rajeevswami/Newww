@@ -1,10 +1,13 @@
 import os
 
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
+os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./pytest-smarthire.db"
 os.environ["SECRET_KEY"] = "test-only-key-not-for-production-use-12345"
 os.environ["DEMO_MODE"] = "true"
 os.environ["OPENAI_API_KEY"] = ""
 os.environ["ENVIRONMENT"] = "development"
+os.environ["QDRANT_URL"] = ":memory:"
+os.environ["SENTRY_DSN"] = ""
+os.environ["CELERY_EAGER"] = "true"
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from app.main import app

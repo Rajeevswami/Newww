@@ -12,7 +12,9 @@ The repository is deliberately honest about its scope. The demo is fully usable 
 | API | FastAPI modular monolith with authentication, workspace, job, resume, application, interview, analytics, billing, and audit routers | `backend/app/main.py` |
 | Persistence | SQLAlchemy models; SQLite for the local demo; PostgreSQL migration path with forced RLS policies | `backend/app/models/entities.py`, `backend/alembic/versions/0001_initial.py` |
 | Interview engine | LangGraph `StateGraph` with question, answer evaluation, follow-up, and scorecard nodes | `backend/app/ai/interview.py` |
-| AI provider boundary | Demo keyword/cosine scoring or optional OpenAI structured parsing, embeddings, questions, evaluation, and scorecard generation | `backend/app/ai/provider.py` |
+| AI provider boundary | Demo keyword scoring or optional OpenAI structured parsing, embeddings, questions, evaluation, and scorecard generation | `backend/app/ai/provider.py` |
+| Vector index | Tenant-filtered Qdrant `resumes` and `jobs` collections when OpenAI is connected | `backend/app/ai/vectors.py` |
+| Interview streaming | Additive WebSocket `/api/interviews/{id}/stream` with REST fallback | `backend/app/api/core.py` |
 | Delivery | Dockerfiles, Compose, Nginx reverse proxy, Alembic, GitHub Actions | `docker-compose.yml`, `.github/workflows/ci-cd.yml` |
 
 ## Screenshots from the running app
@@ -117,7 +119,7 @@ The footer in the browser labels the active mode. The two modes are intentionall
 | Capability | Without `OPENAI_API_KEY` | With `OPENAI_API_KEY` |
 | --- | --- | --- |
 | Resume parsing | Known-skill keyword extraction; experience and education remain empty | Native Pydantic structured output from the configured OpenAI model |
-| Matching | Required-skill overlap percentage | `text-embedding-3-small` cosine similarity, bounded to 0–100 |
+| Matching | Required-skill overlap percentage | `text-embedding-3-small` embeddings stored in tenant-filtered Qdrant collections |
 | Interview questions | Role/skill templates with a length-based follow-up branch | Structured contextual question from the role, resume, and conversation state |
 | Answer evaluation | Word-count demo score and guidance | Structured relevance, specificity, technical-depth evaluation |
 | Scorecard | Clearly labeled demo coaching feedback | Structured contextual feedback with human-review language |
@@ -128,7 +130,7 @@ Resume, job-description, and answer text is cleaned and passed as untrusted data
 
 ### OpenAI
 
-Set `OPENAI_API_KEY` and optionally `OPENAI_MODEL` in `backend/.env`, then restart the API. Provider failures are surfaced as API errors; the application does not silently turn a failed provider request into fake connected-AI output. Embeddings are currently computed per application and are not persisted or indexed in Qdrant/Chroma.
+Set `OPENAI_API_KEY` and optionally `OPENAI_MODEL` in `backend/.env`, then restart the API. Provider failures are surfaced as API errors; the application does not silently turn a failed provider request into fake connected-AI output. When OpenAI is connected, resume and job embeddings are upserted into Qdrant (`QDRANT_URL`, default `http://localhost:6333`) and match queries are filtered by `tenant_id`. Demo mode never calls Qdrant.
 
 ### Email
 
@@ -136,7 +138,7 @@ Set `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, and `EMAIL_FROM`, ru
 
 ```bash
 cd backend
-celery -A app.tasks.email.celery worker --loglevel=info
+celery -A app.tasks.celery_app.celery worker --loglevel=info
 ```
 
 The verification and password-reset routes queue email only when SMTP is configured. In demo mode, action tokens are returned by the API so local flows can be exercised without an email account. A production rollout should add a transactional outbox before treating delivery as durable.
@@ -155,7 +157,7 @@ The following checks were run successfully in this working session:
 .venv/bin/ruff format --check backend
 cd backend
 ../.venv/bin/pytest -q
-# 16 passed
+# 20 passed
 
 # Frontend
 cd ../frontend
@@ -186,6 +188,20 @@ The browser suite covers recruiter candidate review and job lifecycle, a complet
 5. Configure exact CORS origins, SMTP sender DNS, Stripe callbacks, backups, restore drills, retention/deletion workflows, request limits, monitoring, and accessibility/security review.
 6. Validate matching and coaching quality with a reviewed dataset. Scores are similarity/coaching signals, not calibrated hiring probabilities.
 
-Intentional MVP boundaries include cross-company candidate identity and marketplace search, recruiter invitations and granular permissions, durable embedding indexes, queued resume parsing, streamed/audio/video interviews, scheduling, object storage and antivirus scanning, OCR, candidate deletion/export workflows, DB-side pagination for large workspaces, usage metering, monitoring integrations, and cloud deployment wiring.
+## Implemented in this codebase
+
+| Area | What is actually implemented |
+| --- | --- |
+| Qdrant vector index | Tenant-filtered `resumes` and `jobs` collections, used only when `OPENAI_API_KEY` is set |
+| Interview streaming | WebSocket token stream plus the original REST answer endpoint |
+| API keys and RBAC | Tenant-admin key mint/list/revoke, `sk_` bearer auth, scope helper, platform `super_admin` console |
+| Observability | Prometheus `GET /api/metrics` and optional Sentry (`SENTRY_DSN`) with `tenant_id` tags, not raw JWTs |
+| Async resume jobs | Upload returns 202/`pending`; apply returns `scoring` until Celery (eager in tests) finishes |
+
+Point an existing Prometheus/Grafana stack at `/api/metrics` (see the Compose comment). No Grafana container is bundled.
+
+## Remaining roadmap
+
+Intentional MVP boundaries include cross-company candidate identity and marketplace search, recruiter invitations, audio/video interviews, scheduling, object storage and antivirus scanning, OCR, candidate deletion/export workflows, DB-side pagination for large workspaces, usage metering, a bundled Grafana service, and cloud deployment wiring.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the code-level trust boundaries and state model. See [docs/OPERATIONS.md](docs/OPERATIONS.md) for local operations, deployment runbooks, failure handling, and verification commands.

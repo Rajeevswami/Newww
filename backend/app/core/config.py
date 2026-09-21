@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     smtp_user: str = ""
     smtp_password: str = ""
     email_from: str = "noreply@smarthire.example"
+    qdrant_url: str = "http://localhost:6333"
+    sentry_dsn: str = ""
+    celery_eager: bool = False
 
 
 settings = Settings()
@@ -35,5 +38,9 @@ if settings.environment == "production":
         )
     if not settings.frontend_url.startswith("https://"):
         raise RuntimeError("Production requires HTTPS")
+    if not settings.qdrant_url or settings.qdrant_url in {":memory:", "memory", "memory://"}:
+        raise RuntimeError("Production requires a durable QDRANT_URL")
+    if settings.celery_eager:
+        raise RuntimeError("Production cannot use eager Celery")
 if not settings.secret_key:
     settings.secret_key = secrets.token_urlsafe(48)
