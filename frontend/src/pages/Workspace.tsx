@@ -950,7 +950,7 @@ export function InterviewDetail({
         const timer = window.setTimeout(() => {
           ws.close();
           reject(new Error('socket-timeout'));
-        }, 20000);
+        }, 3000);
         ws.onerror = () => {
           window.clearTimeout(timer);
           reject(new Error('socket-failed'));
