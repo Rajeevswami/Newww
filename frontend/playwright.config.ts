@@ -20,7 +20,12 @@ export default defineConfig({
       url: 'http://localhost:8000/api/health',
       reuseExistingServer: !process.env.CI,
       timeout: 60000,
-      env: { DEMO_MODE: 'true', DATABASE_URL: 'sqlite+aiosqlite:///./e2e.db', OPENAI_API_KEY: '' },
+      env: {
+        DEMO_MODE: 'true',
+        DATABASE_URL: 'sqlite+aiosqlite:///./e2e.db',
+        OPENAI_API_KEY: '',
+        CELERY_EAGER: 'true',
+      },
     },
     {
       command: 'npm run dev -- --port 5173',
