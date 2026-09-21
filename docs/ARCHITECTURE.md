@@ -1,93 +1,130 @@
-# Architecture and decisions
+# SmartHire AI architecture
 
-## Runtime
+This document describes the architecture implemented in this repository. It distinguishes current behavior from scale-up ideas so that the demo is not mistaken for a production-certified hiring system.
+
+## Runtime topology
 
 ```text
-Browser / React + TypeScript + TanStack Query
-          │ same-origin HTTPS /api
+Browser
+  React + TypeScript + TanStack Query
+          │ same-origin /api
           ▼
-Nginx (production image) or Vite proxy (development)
+Nginx (Compose) or Vite proxy (development)
           │
           ▼
-FastAPI modular monolith
-  ├── Authentication + workspace onboarding
-  ├── Jobs / resumes / applications / analytics
-  ├── LangGraph interview service
-  └── Stripe webhook + checkout boundary
-          │                  │
-          ▼                  ▼
-PostgreSQL + RLS        OpenAI, when configured
-(SQLite in local demo)
+FastAPI application
+  ├── auth + tenant onboarding
+  ├── jobs / resumes / applications
+  ├── analytics / audit activity
+  ├── LangGraph interviews
+  └── Stripe boundary
+          │                    │
+          ▼                    ▼
+PostgreSQL + RLS              OpenAI (optional)
+(SQLite in demo mode)         embeddings + structured output
           │
           ▼
-Celery + Redis → SMTP verification / reset email
+Celery + Redis (optional) → SMTP verification/reset email
 ```
 
-The browser never connects directly to the database, Redis, or OpenAI. Provider credentials never enter frontend bundles. API documentation is served under `/api/docs`. React UI primitives and responsive styling are bespoke CSS, rather than a shadcn/Tailwind dependency; they include keyboard-focus handling, labeled forms, modal focus trapping, reduced-motion styling, and mobile navigation. An independent WCAG contrast/a11y audit is still needed.
+`backend/app/main.py` creates the FastAPI application, installs CORS and response security headers, creates local tables outside production, optionally seeds the demo tenant, and mounts the auth, core, and billing routers under `/api`. The frontend calls relative `/api` URLs. In development, `frontend/vite.config.ts` proxies those requests to the API; in Compose, Nginx proxies them to the `api` service.
+
+The browser does not connect directly to the database, Redis, or OpenAI. Provider keys are read by the backend settings object and are not part of the frontend bundle. Fonts are bundled through `@fontsource-variable`, so the main app does not need a Google Fonts request.
+
+## Application boundaries
+
+### Frontend
+
+- `frontend/src/App.tsx` owns the session, in-memory access token, hash-based page navigation, role switcher, global search, modal state, and top-level queries.
+- `frontend/src/pages/Dashboard.tsx` renders recruiter overview metrics, charts, funnel, matched candidates, and active jobs.
+- `frontend/src/pages/Workspace.tsx` renders job forms/details, candidate search/details, interview lists/details, analytics, resume upload, and the candidate dashboard.
+- `frontend/src/pages/Settings.tsx` renders workspace settings, team, billing, security/help content.
+- `frontend/src/api/client.ts` centralizes relative fetch calls, refresh-on-401 behavior, typed response shapes, and CSV export.
+- `frontend/src/styles.css` contains the responsive UI system, light theme, focus states, reduced-motion rules, modal treatment, and mobile navigation.
+
+The client uses TanStack Query for server data. It intentionally keeps the access JWT in a module variable rather than local storage. A refresh cookie is sent by the browser with `credentials: include`.
+
+### Backend
+
+- `backend/app/api/auth.py` handles signup, login, refresh rotation, logout, current-user lookup, demo login, verification, and password reset.
+- `backend/app/api/core.py` handles jobs, applications, resume extraction/upload, interviews, analytics, activity, workspace updates, and team listing.
+- `backend/app/api/billing.py` creates Stripe Checkout sessions and validates subscription webhooks when configured.
+- `backend/app/models/entities.py` defines tenants, users, jobs, resumes, applications, interviews, refresh/action tokens, and audit logs.
+- `backend/app/services/seed.py` creates reproducible fictional fixtures only when `DEMO_MODE=true`.
+- `backend/app/tasks/email.py` is a Celery task that sends verification/reset email through SMTP with retry-on-`OSError` behavior.
+
+The API adds an explicit `tenant_id` predicate to tenant-owned queries. `current_user()` derives the tenant from the signed access token, loads the user within that tenant, checks the token version, and sets the request tenant context.
 
 ## Tenant trust boundary
 
-- `tenant_id` is derived from a signed access token, then validated against the actual user row. Workspace IDs in request bodies cannot change the authenticated scope.
-- Workspace signup resolves a tenant by public slug. Candidate signup cannot grant recruiter/admin roles. Tenant-admin signup creates a **new** tenant; it cannot elevate someone in an existing workspace.
-- Before tenant-scoped queries, the API sets `set_config('app.tenant_id', tenant_id, true)` in the request transaction. Transaction-local scope prevents tenant context leaking across pooled connections.
-- Every tenant-owned table has `tenant_id`, a tenant/id index, and a PostgreSQL policy with both `USING` and `WITH CHECK`. `FORCE ROW LEVEL SECURITY` is enabled by migration.
-- Application queries additionally filter tenant IDs. Joins explicitly constrain each involved tenant. Candidates have a second, within-tenant ownership check on applications, resumes, and interviews.
-- Tenants themselves are not globally exposed through a listing endpoint. The non-owner application DB role can resolve workspace identity for signup/login; administrative profile routes fetch only the authenticated tenant.
-- Superusers and `BYPASSRLS` roles still bypass RLS. This is why migration and application credentials are separate.
-- Tenant context alone is not candidate authorization. RLS is a company boundary; role and user checks remain mandatory.
+1. Signup creates a new tenant only for a `tenant_admin`. Candidate signup resolves an existing public workspace slug and cannot self-assign a recruiter/admin role.
+2. Every tenant-owned model has a `tenant_id` foreign key and tenant/id index. API dependencies enforce role checks (`tenant_admin`, recruiter, candidate).
+3. PostgreSQL migrations enable and force row-level security on every table with `tenant_id`. The policy compares `tenant_id` with the transaction-local `app.tenant_id` setting.
+4. The application also filters tenant IDs in every private query and constrains joined users, jobs, and resumes to the same tenant. Candidate routes add user ownership checks for resumes, applications, and interviews.
+5. SQLite has no RLS. Local tests therefore validate application-level isolation; `backend/tests/check_postgres_rls.py` is the explicit database-level check for a disposable PostgreSQL database.
+6. A PostgreSQL superuser or `BYPASSRLS` role can bypass RLS. This is why Compose separates the migration owner from the restricted application role.
 
-## Authentication
+Tenant scope is a company boundary, not a replacement for role or ownership authorization.
 
-Access JWTs expire after 15 minutes and remain in browser memory. Refresh JWTs contain signed tenant context plus a random nonce, expire after seven days, and are delivered only in an HTTP-only cookie. Their full values are SHA-256 hashed in the DB. Refresh updates the old token atomically before issuing the replacement. Reuse is denied. Token-version checks let password reset/logout invalidate existing access tokens immediately. Logout revokes all refresh tokens for that account.
-
-Verification/reset action tokens are purpose-specific, signed, hash-stored, one-hour, single-use tokens. Token delivery is queued to SMTP. The current queue enqueue occurs before the request transaction commits; production delivery should use a transactional outbox to guarantee commit-before-send and durable retry bookkeeping.
-
-Bcrypt is used directly, avoiding Passlib's compatibility issues with newer bcrypt releases. JWT is implemented with PyJWT rather than python-jose. Password length is bounded in UTF-8 bytes because bcrypt truncates after 72 bytes.
-
-## Interview state machine
-
-`backend/app/ai/interview.py` compiles an actual LangGraph `StateGraph`:
+## Authentication lifecycle
 
 ```text
-START ── new session ───────────────► ask_question ──► END (await user)
-  │
-  └── submitted answer ──► evaluate_answer
-                              │ conditional route_next
-                              ├── fewer than 5 questions ─► ask_question ─► END
-                              └── 5 questions ─► generate_scorecard ─► END
+signup/login
+    │
+    ├── short-lived access JWT (15 minutes, browser memory)
+    └── refresh JWT (7 days, HTTP-only SameSite cookie)
+             │
+             └── only SHA-256 digest stored in refresh_tokens
+
+refresh → atomically revoke old digest → issue replacement cookie
+logout / password reset → revoke refresh rows + increment token_version
 ```
 
-State carries `resume_context`, `job_context`, `conversation_history`, `topics_covered`, `question_count`, the current answer/evaluation, all evaluations, and the final scorecard. State/transcript are persisted after each request, so sessions survive process restarts. Each answer submits its expected turn. An atomic claim and a unique partial index prevent stale/double answers and concurrent unfinished sessions. The graph runs inside the request transaction; this is correct for the MVP but holds a DB connection during provider latency. A durable job/outbox model is the next step.
+Access and refresh tokens carry signed user/tenant context and a token type. Refresh rotation updates the old row before issuing a replacement. Access validation checks the token version against the user row, so logout and password reset invalidate existing access tokens. Passwords use bcrypt directly. Verification and reset action tokens are signed, purpose-specific, hashed in the database, expire after one hour, and are single-use.
 
-There is no psychological confidence score inferred from text. Evaluation addresses relevance, specificity, and technical depth. Recommendations explicitly support human review, not automatic rejection or hiring. Demo scoring is transparently not evidence of ability.
+The current email enqueue happens before the request transaction commits. A transactional outbox is an explicit production follow-up, not an existing guarantee.
 
 ## Resume and matching lifecycle
 
-1. Candidate uploads a PDF/DOCX, validated by extension, signatures, size, and archive expansion.
-2. Text extraction runs off the event loop. Scanned PDFs without text are rejected with a useful error.
-3. Structured parsing uses OpenAI native Pydantic output or the documented demo keyword extractor.
-4. Only parsed JSON is persisted; originals are discarded. No public file URLs expose candidate PII.
-5. Applying snapshots the **resume ID** in the application. Later uploads do not silently rewrite old applications.
-6. Matching compares resume and JD using embeddings/cosine similarity when configured. Demo mode computes required-skill overlap. No hidden LLM call is made without an API key.
+1. Candidate upload accepts only `.pdf` or `.docx` and caps the request at 5 MB.
+2. PDF signatures, page count, DOCX ZIP structure, and ZIP expansion are checked before extraction. Text extraction runs in a threadpool. Scanned or otherwise unreadable documents are rejected.
+3. The original bytes are not persisted. Parsed JSON is stored on `resumes.parsed_json`.
+4. Without an OpenAI key, parsing searches a fixed known-skill list and leaves experience/education empty. With a key, the provider asks for a Pydantic `ParsedResume` object.
+5. Applying stores the resume ID used for that application. Later resume uploads do not mutate the old application snapshot.
+6. Matching uses required-skill overlap in demo mode or two `text-embedding-3-small` vectors and cosine similarity when OpenAI is configured. The current code computes embeddings per request; it does not persist or index them.
 
-At scale, store originals privately in S3, use expiring signed URLs and a malware-scanning quarantine, enqueue parse/embedding jobs, persist embedding/version metadata, and index per-tenant payloads in Qdrant. Recheck tenant scope before returning vector-search results; a vector filter is not the sole authorization boundary.
+Uploaded resume and interview content is application data, not an instruction source. Connected provider prompts explicitly separate the task from supplied documents and forbid protected-attribute or autonomous-hiring behavior.
 
-## Metrics and audit
+## Interview state machine
 
-Dashboard aggregates are computed from the authenticated tenant's actual rows. Period filters use UTC dates and six buckets. Funnel bars represent **current stage or later**, not historic events. Rejected candidates remain in the Applied count but do not contribute to later stages. Current activity is not a measure of processing time or a scientifically validated quality signal.
+`backend/app/ai/interview.py` compiles a LangGraph `StateGraph`:
 
-Audit rows cover login and the sensitive mutations currently supported. Sensitive tokens/passwords and raw resume text are not logged. The simple notification view reads recent audit entries; durable per-recipient read state and separate notification preferences remain future work.
+```text
+START
+  ├─ no answer → ask_question → END (await browser)
+  └─ answer → evaluate_answer
+                    ├─ question_count < 5 → ask_question → END
+                    └─ question_count >= 5 → generate_scorecard → END
+```
 
-## Scale-up / release sequence
+State contains role/resume context, conversation history, topics, question count, current evaluation, evaluation history, and scorecard. `start_interview` persists the initial question. Each answer requires the expected turn count; `answer()` atomically claims an in-progress row as `processing` before running the graph, preventing a stale concurrent answer from spending another provider call. The partial unique index prevents two unfinished interviews for one application.
 
-1. Security/privacy review, bias evaluation, gold-set semantic tests, calibrated matching thresholds.
-2. DB-side pagination and bounded analytics queries; read replicas/PgBouncer where justified by measured load.
-3. Transactional outbox, queued parsing/scoring, independent workers, idempotent job retries.
-4. Redis cache keyed by tenant + resource + version, with tenant-aware invalidation.
-5. Qdrant indexes and embedding model versioning; protect all search payloads with tenant filters and DB verification.
-6. Authenticated streaming transport with per-user concurrency limits, connection expiry, and cancellation.
-7. Prometheus request/provider latency + error metrics, queue-depth alerts, privacy-safe Sentry tracing, Grafana dashboards.
-8. Golden-path load tests and backup recovery drills. Only then publish scale/SLO claims.
-9. Split services only when team/deployment needs justify it; the present routers/providers form extraction seams.
+Demo mode evaluates answer length and produces clearly labeled coaching feedback. Connected mode uses structured evaluation and scorecard responses. The UI describes the result as guidance and human-review support; it is not a final hiring decision.
 
-Suggested initial alerts: elevated API 5xx, OpenAI timeouts, growing Celery queue age, DB connection saturation, refresh-token reuse spikes, and sustained tenant-level cost anomalies. Monitoring infrastructure is a design, not a running integration in this repo.
+The graph runs inside the request transaction. This keeps the MVP flow simple but holds a database connection while a provider call is in flight. A queued durable interview job/outbox is the scale-up path.
+
+## Metrics, audit, and exports
+
+Recruiter analytics queries tenant-scoped rows and calculates period metrics, six chart buckets, and current-stage-or-later funnel values. Rejected rows remain in the applied count and do not contribute to later funnel stages. Dashboard sparkline points are illustrative UI values; primary metric cards and charts use API data.
+
+Sensitive mutations supported by the API write `AuditLog` rows, including login, workspace/job changes, status changes, resume upload, interview completion, and export requests. Passwords, token values, and raw resume text are not written to audit details. CSV and JSON exports are initiated in the browser; the CSV helper records an export event.
+
+## Delivery and security posture
+
+- Development: Uvicorn + Vite + SQLite, with demo seeding enabled by default.
+- Compose: owner-only migration, restricted API/worker role, PostgreSQL RLS, Redis, Celery, and unprivileged Nginx.
+- Nginx: same-origin `/api` proxy, 6 MB upload cap, security headers, local asset caching, and a narrowly scoped Swagger CDN policy.
+- Production settings refuse startup unless demo mode is off, a 32-character secret exists, PostgreSQL is used, HTTPS frontend URL is set, and OpenAI/SMTP are configured.
+- The repository does not provide TLS termination, secret management, backups, monitoring, malware scanning, OCR, retention/deletion workflows, or a cloud deployment.
+
+See [OPERATIONS.md](OPERATIONS.md) for commands, runbooks, verification, and incident boundaries.
