@@ -27,6 +27,16 @@ services:
       timeout: 3s
       retries: 10
     restart: unless-stopped
+  qdrant:
+    image: qdrant/qdrant:v1.13.6
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: [CMD-SHELL, "wget -qO- http://127.0.0.1:6333/readyz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
   migrate:
     build: ./backend
     env_file: .env
@@ -42,10 +52,13 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://smarthire_app:${APP_DB_PASSWORD:-local-app-change-me}@postgres:5432/smarthire
       REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
     depends_on:
       migrate:
         condition: service_completed_successfully
       redis:
+        condition: service_healthy
+      qdrant:
         condition: service_healthy
     expose: [8000]
     healthcheck:
@@ -60,11 +73,14 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://smarthire_app:${APP_DB_PASSWORD:-local-app-change-me}@postgres:5432/smarthire
       REDIS_URL: redis://redis:6379/0
-    command: celery -A app.tasks.email.celery worker --loglevel=info --concurrency=2
+      QDRANT_URL: http://qdrant:6333
+    command: celery -A app.tasks.celery_app.celery worker --loglevel=info --concurrency=2
     depends_on:
       migrate:
         condition: service_completed_successfully
       redis:
+        condition: service_healthy
+      qdrant:
         condition: service_healthy
     restart: unless-stopped
   web:
@@ -74,6 +90,10 @@ services:
       api:
         condition: service_healthy
     restart: unless-stopped
+# Grafana: scrape the API Prometheus endpoint at http://api:8000/api/metrics
+# (or http://localhost:8080/api/metrics through Nginx). No Grafana container is
+# bundled; point an existing Prometheus/Grafana stack at that path.
 volumes:
   postgres_data:
   redis_data:
+  qdrant_data:

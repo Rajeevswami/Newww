@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import {
   api,
+  getToken,
   post,
   exportCSV,
   type Analytics,
@@ -323,6 +324,8 @@ export function JobDetail({
     queryKey: ['applications'],
     queryFn: () => api<Application[]>('/applications'),
     enabled: candidate,
+    refetchInterval: (query) =>
+      query.state.data?.some((a) => a.status === 'scoring' || a.match_score == null) ? 1000 : false,
   });
   const applied = apps.some((a) => a.job_id === job.id);
   const apply = useMutation({
@@ -430,6 +433,8 @@ export function CandidatesPage({ onSelect, notify }: { onSelect: (a: Application
   const { data: rows = [], isLoading } = useQuery({
     queryKey: ['applications'],
     queryFn: () => api<Application[]>('/applications'),
+    refetchInterval: (query) =>
+      query.state.data?.some((a) => a.status === 'scoring' || a.match_score == null) ? 1000 : false,
   });
   const [search, setSearch] = useState('');
   const [status, setStatus] = useState('All candidates');
@@ -439,7 +444,7 @@ export function CandidatesPage({ onSelect, notify }: { onSelect: (a: Application
     (a) =>
       `${a.name} ${a.email} ${a.job_title}`.toLowerCase().includes(search.toLowerCase()) &&
       (status === 'All candidates' || a.status === status) &&
-      a.match_score >= score,
+      (a.match_score ?? 0) >= score,
   );
   const resetPage = () => setPage(1);
   return (
@@ -604,7 +609,7 @@ export function CandidateDetail({
           </div>
           <div className="large-match">
             <Sparkles size={17} />
-            <strong>{initial.match_score}%</strong>
+            <strong>{initial.match_score == null ? '—' : `${initial.match_score}%`}</strong>
             <small>AI match</small>
           </div>
         </div>
@@ -913,28 +918,75 @@ export function InterviewDetail({
   const qc = useQueryClient();
   const [tab, setTab] = useState(initial.status === 'completed' ? 'Scorecard' : 'Conversation');
   const [answer, setAnswer] = useState('');
+  const [streaming, setStreaming] = useState('');
+  const [sending, setSending] = useState(false);
   const { data: interview = initial } = useQuery({
     queryKey: ['interview', initial.id],
     queryFn: () => api<Interview>(`/interviews/${initial.id}`),
     initialData: initial,
   });
-  const send = useMutation({
-    mutationFn: () =>
-      post<Interview>(`/interviews/${initial.id}/answer`, {
-        answer,
-        expected_count: interview.transcript_json.filter((m) => m.role === 'assistant').length,
-      }),
-    onSuccess: (i) => {
+  async function submitAnswer() {
+    const expected = interview.transcript_json.filter((m) => m.role === 'assistant').length;
+    setSending(true);
+    setStreaming('');
+    const finish = (i: Interview) => {
       qc.setQueryData(['interview', i.id], i);
       qc.invalidateQueries({ queryKey: ['interviews'] });
       setAnswer('');
+      setStreaming('');
       if (i.status === 'completed') {
         setTab('Scorecard');
         notify('Practice complete. Your feedback is ready.');
       }
-    },
-    onError: (e: Error) => notify(e.message),
-  });
+    };
+    try {
+      const token = getToken();
+      const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      const streamed = await new Promise<Interview>((resolve, reject) => {
+        const ws = new WebSocket(
+          `${protocol}//${window.location.host}/api/interviews/${initial.id}/stream?access_token=${encodeURIComponent(token)}`,
+        );
+        let draft = '';
+        const timer = window.setTimeout(() => {
+          ws.close();
+          reject(new Error('socket-timeout'));
+        }, 3000);
+        ws.onerror = () => {
+          window.clearTimeout(timer);
+          reject(new Error('socket-failed'));
+        };
+        ws.onopen = () => ws.send(JSON.stringify({ answer, expected_count: expected }));
+        ws.onmessage = (event) => {
+          const payload = JSON.parse(event.data);
+          if (payload.type === 'token') {
+            draft += payload.text;
+            setStreaming(draft);
+          } else if (payload.type === 'done') {
+            window.clearTimeout(timer);
+            ws.close();
+            resolve(payload.interview);
+          } else if (payload.type === 'error') {
+            window.clearTimeout(timer);
+            reject(new Error(payload.detail || 'socket-failed'));
+          }
+        };
+      });
+      finish(streamed);
+    } catch {
+      try {
+        finish(
+          await post<Interview>(`/interviews/${initial.id}/answer`, {
+            answer,
+            expected_count: expected,
+          }),
+        );
+      } catch (error) {
+        notify((error as Error).message);
+      }
+    } finally {
+      setSending(false);
+    }
+  }
   const score = interview.scorecard_json;
   return (
     <Modal
@@ -1036,13 +1088,27 @@ export function InterviewDetail({
                 </div>
               </div>
             ))}
+            {streaming && (
+              <div className="message assistant">
+                <span className="message-icon">
+                  <Sparkles size={17} />
+                </span>
+                <div>
+                  <b>
+                    SmartHire interviewer
+                    <small>AI</small>
+                  </b>
+                  <p>{streaming}</p>
+                </div>
+              </div>
+            )}
           </div>
           {interview.status === 'in_progress' && candidate && (
             <form
               className="answer-form"
               onSubmit={(e) => {
                 e.preventDefault();
-                send.mutate();
+                void submitAnswer();
               }}
             >
               <textarea
@@ -1057,8 +1123,8 @@ export function InterviewDetail({
               />
               <div>
                 <span>Your answers are saved when you send them.</span>
-                <button className="btn primary" disabled={send.isPending || answer.trim().length < 5}>
-                  {send.isPending ? 'Thinking…' : 'Send answer'}
+                <button className="btn primary" disabled={sending || answer.trim().length < 5}>
+                  {sending ? 'Thinking…' : 'Send answer'}
                   <Send size={15} />
                 </button>
               </div>
@@ -1151,6 +1217,7 @@ export function ResumePage({ notify }: { notify: Notify }) {
   const { data: resumes = [], isLoading } = useQuery({
     queryKey: ['resumes'],
     queryFn: () => api<Resume[]>('/resumes'),
+    refetchInterval: (query) => (query.state.data?.some((r) => r.status === 'pending') ? 1000 : false),
   });
   const upload = useMutation({
     mutationFn: (file: File) => {
@@ -1230,7 +1297,9 @@ export function ResumePage({ notify }: { notify: Notify }) {
                 <p>Uploaded {dateLabel(latest.created_at)} · Latest resume</p>
               </div>
             </div>
-            <Badge status="Completed">Parsed</Badge>
+            <Badge status={latest.status === 'pending' ? 'Interview' : 'Completed'}>
+              {latest.status === 'pending' ? 'Parsing' : latest.status === 'failed' ? 'Failed' : 'Parsed'}
+            </Badge>
           </div>
           <div className="detail-body">
             <h3>Your profile at a glance</h3>
@@ -1289,6 +1358,8 @@ export function CandidateHome({
   const { data: apps = [] } = useQuery({
     queryKey: ['applications'],
     queryFn: () => api<Application[]>('/applications'),
+    refetchInterval: (query) =>
+      query.state.data?.some((a) => a.status === 'scoring' || a.match_score == null) ? 1000 : false,
   });
   const { data: jobs = [] } = useQuery({ queryKey: ['jobs'], queryFn: () => api<Job[]>('/jobs') });
   const start = useMutation({
@@ -1351,7 +1422,15 @@ export function CandidateHome({
           <Sparkles />
           <div>
             <strong>
-              {apps.length ? Math.round(apps.reduce((sum, a) => sum + a.match_score, 0) / apps.length) : 0}%
+              {apps.filter((a) => a.match_score != null).length
+                ? Math.round(
+                    apps
+                      .filter((a) => a.match_score != null)
+                      .reduce((sum, a) => sum + (a.match_score || 0), 0) /
+                      apps.filter((a) => a.match_score != null).length,
+                  )
+                : 0}
+              %
             </strong>
             <span>Your average match</span>
           </div>

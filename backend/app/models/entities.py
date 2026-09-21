@@ -80,8 +80,9 @@ class Resume(TenantScoped, Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
     filename: Mapped[str] = mapped_column(String(255))
-    parsed_json: Mapped[dict] = mapped_column(JSON)
+    parsed_json: Mapped[dict] = mapped_column(JSON, default=dict)
     embedding: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(20), default="ready")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
@@ -95,7 +96,7 @@ class Application(TenantScoped, Base):
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"))
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
     resume_id: Mapped[str] = mapped_column(ForeignKey("resumes.id"))
-    match_score: Mapped[float] = mapped_column(Float, default=0)
+    match_score: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     status: Mapped[str] = mapped_column(String(30), default="New")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
@@ -143,6 +144,18 @@ class ActionToken(TenantScoped, Base):
     purpose: Mapped[str] = mapped_column(String(20))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     used: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class ApiKey(TenantScoped, Base):
+    __tablename__ = "api_keys"
+    __table_args__ = (Index("ix_api_keys_tenant_id_id", "tenant_id", "id"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    name: Mapped[str] = mapped_column(String(80))
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    scopes: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class AuditLog(TenantScoped, Base):

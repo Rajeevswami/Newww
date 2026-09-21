@@ -1,20 +1,63 @@
 import io
+import secrets
 import zipfile
 from datetime import timedelta
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Request
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select, func, update
 from sqlalchemy.exc import IntegrityError
 from pypdf import PdfReader
 from docx import Document
 from starlette.concurrency import run_in_threadpool
-from app.models.entities import Job, User, Resume, Application, Interview, AuditLog, Tenant, now
-from app.core.database import get_db
-from app.core.security import current_user, recruiter, admin, candidate
+from app.models.entities import (
+    ApiKey,
+    Job,
+    User,
+    Resume,
+    Application,
+    Interview,
+    AuditLog,
+    Tenant,
+    now,
+)
+from app.core.database import Session, get_db
+from app.core.security import (
+    admin,
+    candidate,
+    current_user,
+    digest,
+    recruiter,
+    require_scopes,
+    user_from_access_token,
+)
 from app.core.config import settings
-from app.schemas.requests import JobInput, StatusInput, InterviewInput, AnswerInput, WorkspaceInput
-from app.ai.provider import parse_resume, match_resume
-from app.ai.interview import interview_graph
+from app.schemas.requests import (
+    AnswerInput,
+    ApiKeyInput,
+    InterviewInput,
+    JobInput,
+    StatusInput,
+    WorkspaceInput,
+)
+from app.ai.interview import (
+    evaluate_answer,
+    generate_scorecard,
+    interview_graph,
+    route_next,
+    stream_ask_question,
+)
 from app.api.auth import limiter
+from app.tasks.ai import parse_resume_task, score_application_task
 
 
 def tenant_limit_key(request: Request):
@@ -43,8 +86,12 @@ def audit(db, user, action, details=None):
     )
 
 
+def interview_payload(row):
+    return {k: v for k, v in serialize(row).items() if k != "state_json"}
+
+
 @router.get("/jobs")
-async def jobs(user=Depends(current_user), db=Depends(get_db)):
+async def jobs(user=Depends(require_scopes("jobs:read")), db=Depends(get_db)):
     query = select(Job).where(Job.tenant_id == user.tenant_id)
     if user.role == "candidate":
         query = query.where(Job.status == "active")
@@ -150,6 +197,15 @@ async def applications(user=Depends(current_user), db=Depends(get_db)):
     return await application_rows(db, user)
 
 
+@router.get("/applications/{application_id}")
+async def get_application(application_id: str, user=Depends(current_user), db=Depends(get_db)):
+    rows = await application_rows(db, user)
+    row = next((item for item in rows if item["id"] == application_id), None)
+    if not row:
+        raise HTTPException(404, "Record not found")
+    return row
+
+
 @router.get("/jobs/{job_id}/matches")
 async def matches(job_id: str, user=Depends(recruiter), db=Depends(get_db)):
     await owned(db, Job, job_id, user)
@@ -189,16 +245,15 @@ async def apply(request: Request, job_id: str, user=Depends(candidate), db=Depen
         )
     ):
         raise HTTPException(409, "You have already applied to this job")
-    try:
-        score = await match_resume(resume.parsed_json, job)
-    except Exception:
-        raise HTTPException(502, "Matching is temporarily unavailable. Please try again.")
+    if resume.status != "ready":
+        raise HTTPException(409, "Your resume is still being processed. Try again in a moment.")
     row = Application(
         tenant_id=user.tenant_id,
         user_id=user.id,
         resume_id=resume.id,
         job_id=job_id,
-        match_score=score,
+        match_score=None,
+        status="scoring",
     )
     db.add(row)
     try:
@@ -206,6 +261,8 @@ async def apply(request: Request, job_id: str, user=Depends(candidate), db=Depen
     except IntegrityError:
         raise HTTPException(409, "You have already applied to this job")
     audit(db, user, "application.created", {"title": job.title})
+    await db.commit()
+    score_application_task.delay(row.id, user.tenant_id)
     return serialize(row)
 
 
@@ -230,7 +287,7 @@ def extract_document(data, filename):
     return "\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs)
 
 
-@router.post("/resumes/upload", status_code=201)
+@router.post("/resumes/upload", status_code=202)
 @limiter.limit("30/minute", key_func=tenant_limit_key)
 async def upload_resume(
     request: Request, file: UploadFile = File(...), user=Depends(candidate), db=Depends(get_db)
@@ -249,14 +306,24 @@ async def upload_resume(
         )
     if len(text.strip()) < 30:
         raise HTTPException(422, "No readable text found. Scanned PDFs are not supported.")
-    try:
-        parsed = await parse_resume(text, user.name)
-    except Exception:
-        raise HTTPException(502, "Resume parsing is unavailable. Please try again.")
-    row = Resume(tenant_id=user.tenant_id, user_id=user.id, filename=filename, parsed_json=parsed)
+    row = Resume(
+        tenant_id=user.tenant_id,
+        user_id=user.id,
+        filename=filename,
+        parsed_json={
+            "name": user.name,
+            "skills": [],
+            "experience": [],
+            "education": [],
+            "summary": "Parsing resume…",
+        },
+        status="pending",
+    )
     db.add(row)
     await db.flush()
     audit(db, user, "resume.uploaded")
+    await db.commit()
+    parse_resume_task.delay(row.id, user.tenant_id, text, user.name)
     return serialize(row)
 
 
@@ -368,7 +435,100 @@ async def start_interview(
 @router.get("/interviews/{interview_id}")
 async def get_interview(interview_id: str, user=Depends(current_user), db=Depends(get_db)):
     row = await check_interview(db, interview_id, user)
-    return {k: v for k, v in serialize(row).items() if k != "state_json"}
+    return interview_payload(row)
+
+
+@router.websocket("/interviews/{interview_id}/stream")
+async def stream_interview(websocket: WebSocket, interview_id: str):
+    await websocket.accept()
+    token = websocket.query_params.get("access_token") or ""
+    async with Session() as db:
+        try:
+            user = await user_from_access_token(token, db)
+            if user.role != "candidate":
+                await websocket.send_json({"type": "error", "detail": "Candidate access required"})
+                await websocket.close(code=1008)
+                return
+            row = await check_interview(db, interview_id, user)
+        except HTTPException as exc:
+            await websocket.send_json({"type": "error", "detail": exc.detail})
+            await websocket.close(code=1008)
+            return
+        try:
+            payload = await websocket.receive_json()
+            answer_text = str(payload.get("answer") or "")
+            expected_count = int(payload.get("expected_count") or 0)
+            if len(answer_text) < 5 or expected_count < 1 or expected_count > 5:
+                await websocket.send_json({"type": "error", "detail": "A valid answer is required"})
+                await websocket.close(code=1008)
+                return
+            if row.status != "in_progress":
+                await websocket.send_json(
+                    {"type": "error", "detail": "This interview is already complete"}
+                )
+                await websocket.close(code=1008)
+                return
+            if row.state_json["question_count"] != expected_count:
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "detail": "This answer was already submitted. Reload the interview.",
+                    }
+                )
+                await websocket.close(code=1008)
+                return
+            claimed = (
+                await db.execute(
+                    update(Interview)
+                    .where(
+                        Interview.id == row.id,
+                        Interview.tenant_id == user.tenant_id,
+                        Interview.status == "in_progress",
+                        Interview.turn == expected_count,
+                    )
+                    .values(status="processing")
+                    .returning(Interview.id)
+                )
+            ).first()
+            if not claimed:
+                await websocket.send_json(
+                    {"type": "error", "detail": "An answer is already being processed"}
+                )
+                await websocket.close(code=1008)
+                return
+            try:
+                state = row.state_json | {"answer": answer_text}
+                state = state | await evaluate_answer(state)
+                if route_next(state) == "generate_scorecard":
+                    state = state | await generate_scorecard(state)
+                else:
+
+                    async def on_token(token_text):
+                        await websocket.send_json({"type": "token", "text": token_text})
+
+                    state = state | await stream_ask_question(state, on_token)
+            except Exception:
+                await websocket.close(code=1011)
+                return
+            row.state_json, row.transcript_json = state, state["conversation_history"]
+            row.turn = state["question_count"]
+            row.status = "completed" if state.get("complete") else "in_progress"
+            if state.get("complete"):
+                row.scorecard_json, row.ended_at = state["scorecard"], now()
+                audit(db, user, "interview.completed")
+                await websocket.send_json(
+                    {"type": "done", "interview": jsonable_encoder(interview_payload(row))}
+                )
+            else:
+                await websocket.send_json(
+                    {"type": "done", "interview": jsonable_encoder(interview_payload(row))}
+                )
+            await db.commit()
+        except WebSocketDisconnect:
+            await db.rollback()
+        except Exception:
+            await db.rollback()
+            await websocket.close(code=1011)
 
 
 @router.post("/interviews/{interview_id}/answer")
@@ -458,8 +618,10 @@ async def analytics(
                 "shortlisted": len([a for a in bucket if a.status in ("Shortlisted", "Hired")]),
             }
         )
+    scored = [a for a in apps if a.match_score is not None]
     advanced = {
         "New": 0,
+        "scoring": 0,
         "Screening": 1,
         "Interview": 2,
         "Shortlisted": 3,
@@ -483,7 +645,7 @@ async def analytics(
             round((len(apps) - len(prior)) / len(prior) * 100) if prior else None
         ),
         "interviews": len([i for i in all_interviews if i.started_at.date() >= cutoff]),
-        "average_match": round(sum(a.match_score for a in apps) / max(1, len(apps)), 1),
+        "average_match": round(sum(a.match_score for a in scored) / max(1, len(scored)), 1),
         "shortlisted": len([a for a in apps if a.status == "Shortlisted"]),
         "completed_interviews": len(completed),
         "series": series,
@@ -520,6 +682,56 @@ async def workspace(data: WorkspaceInput, user=Depends(admin), db=Depends(get_db
     tenant.name = data.name
     audit(db, user, "workspace.updated")
     return {"name": tenant.name}
+
+
+def serialize_api_key(row, raw=None):
+    data = {
+        "id": row.id,
+        "name": row.name,
+        "scopes": row.scopes,
+        "created_at": row.created_at,
+        "last_used_at": row.last_used_at,
+        "revoked": row.revoked,
+        "key_preview": f"sk_{row.tenant_id[:8]}…{row.id[:4]}",
+    }
+    if raw:
+        data["key"] = raw
+    return data
+
+
+@router.post("/api-keys", status_code=201)
+async def create_api_key(data: ApiKeyInput, user=Depends(admin), db=Depends(get_db)):
+    raw = f"sk_{user.tenant_id}.{secrets.token_urlsafe(32)}"
+    row = ApiKey(
+        tenant_id=user.tenant_id,
+        name=data.name,
+        key_hash=digest(raw),
+        scopes=data.scopes,
+    )
+    db.add(row)
+    await db.flush()
+    audit(db, user, "api_key.created", {"name": row.name, "scopes": row.scopes})
+    return serialize_api_key(row, raw)
+
+
+@router.get("/api-keys")
+async def list_api_keys(user=Depends(admin), db=Depends(get_db)):
+    rows = (
+        await db.scalars(
+            select(ApiKey)
+            .where(ApiKey.tenant_id == user.tenant_id)
+            .order_by(ApiKey.created_at.desc())
+        )
+    ).all()
+    return [serialize_api_key(row) for row in rows]
+
+
+@router.delete("/api-keys/{key_id}")
+async def revoke_api_key(key_id: str, user=Depends(admin), db=Depends(get_db)):
+    row = await owned(db, ApiKey, key_id, user)
+    row.revoked = True
+    audit(db, user, "api_key.revoked", {"api_key_id": row.id})
+    return {"ok": True}
 
 
 @router.get("/team")

@@ -160,14 +160,22 @@ async def test_resume_upload_apply_and_duplicate(client):
             )
         },
     )
-    assert response.status_code == 201, response.text
-    assert "Python" in response.json()["parsed_json"]["skills"]
+    assert response.status_code == 202, response.text
+    assert response.json()["status"] == "pending"
+    resume = await client.get(f"/api/resumes/{response.json()['id']}", headers=candidate)
+    assert resume.status_code == 200, resume.text
+    assert resume.json()["status"] == "ready"
+    assert "Python" in resume.json()["parsed_json"]["skills"]
     apps = (await client.get("/api/applications", headers=candidate)).json()
     jobs = (await client.get("/api/jobs", headers=candidate)).json()
     job = next(j for j in jobs if j["id"] not in [a["job_id"] for a in apps])
     response = await client.post(f"/api/applications/{job['id']}/apply", headers=candidate)
     assert response.status_code == 201, response.text
-    assert 0 <= response.json()["match_score"] <= 100
+    assert response.json()["status"] in ("scoring", "New")
+    polled = await client.get(f"/api/applications/{response.json()['id']}", headers=candidate)
+    assert polled.status_code == 200, polled.text
+    assert polled.json()["status"] == "New"
+    assert 0 <= polled.json()["match_score"] <= 100
     assert (
         await client.post(f"/api/applications/{job['id']}/apply", headers=candidate)
     ).status_code == 409
@@ -314,3 +322,118 @@ async def test_logout_revokes_refresh(client):
 )
 def test_cosine_similarity(left, right, expected):
     assert cosine_similarity(left, right) == expected
+
+
+async def test_api_key_lifecycle_scopes_and_super_admin(client):
+    recruiter = await demo(client)
+    candidate = await demo(client, "candidate")
+    created = await client.post(
+        "/api/api-keys", headers=recruiter, json={"name": "ci-reader", "scopes": ["jobs:read"]}
+    )
+    assert created.status_code == 201, created.text
+    raw = created.json()["key"]
+    assert raw.startswith("sk_")
+    listed = (await client.get("/api/api-keys", headers=recruiter)).json()
+    assert raw not in str(listed)
+    assert listed[0]["key_preview"].startswith("sk_")
+    key_headers = {"Authorization": f"Bearer {raw}"}
+    assert (await client.get("/api/jobs", headers=key_headers)).status_code == 200
+    assert (await client.post("/api/jobs", headers=key_headers, json=JOB)).status_code == 403
+    assert (
+        await client.post(
+            "/api/api-keys", headers=candidate, json={"name": "nope", "scopes": ["*"]}
+        )
+    ).status_code == 403
+    assert (await client.get("/api/admin/tenants", headers=recruiter)).status_code == 403
+    headers, _ = await signup(client, "ops-console")
+    from sqlalchemy import select
+    from app.core.database import Session
+    from app.models.entities import User
+
+    async with Session() as db:
+        user = await db.scalar(select(User).where(User.email == "admin@example.com"))
+        user.role = "super_admin"
+        await db.commit()
+    tenants = await client.get("/api/admin/tenants", headers=headers)
+    assert tenants.status_code == 200, tenants.text
+    assert len(tenants.json()) >= 2
+    acme = next(row for row in tenants.json() if row["slug"] == "acme")
+    patched = await client.patch(
+        f"/api/admin/tenants/{acme['id']}/plan", headers=headers, json={"plan": "Enterprise"}
+    )
+    assert patched.status_code == 200
+    assert patched.json()["plan"] == "Enterprise"
+
+
+async def test_interview_websocket_streams_a_demo_question(client):
+    import asyncio
+    from starlette.testclient import TestClient
+    from app.main import app as asgi_app
+
+    candidate = await demo(client, "candidate")
+    application = (await client.get("/api/applications", headers=candidate)).json()[0]
+    start = await client.post(
+        "/api/interviews/start", headers=candidate, json={"application_id": application["id"]}
+    )
+    assert start.status_code == 201, start.text
+    token = candidate["Authorization"].split(" ", 1)[1]
+    interview_id = start.json()["id"]
+
+    def exchange():
+        test_client = TestClient(asgi_app)
+        with test_client.websocket_connect(
+            f"/api/interviews/{interview_id}/stream?access_token={token}"
+        ) as socket:
+            socket.send_json(
+                {
+                    "answer": "I interviewed customers, evaluated alternatives, worked with engineering, and measured the results of a successful product release.",
+                    "expected_count": 1,
+                }
+            )
+            messages = []
+            while True:
+                payload = socket.receive_json()
+                messages.append(payload)
+                if payload.get("type") in {"done", "error"}:
+                    break
+            return messages
+
+    messages = await asyncio.to_thread(exchange)
+    assert messages, "websocket returned no messages"
+    assert any(item.get("type") == "token" and item.get("text") for item in messages), messages
+    done = messages[-1]
+    assert done["type"] == "done"
+    assert done["interview"]["status"] == "in_progress"
+    assert len(done["interview"]["transcript_json"]) == 3
+
+
+async def test_metrics_endpoint_is_public(client):
+    response = await client.get("/api/metrics")
+    assert response.status_code == 200
+    assert "http_request" in response.text or "python_" in response.text
+
+
+def test_qdrant_match_never_returns_another_tenant_resume():
+    from app.ai.vectors import (
+        ensure_collections,
+        reset_client,
+        search_resumes,
+        upsert_resume_vector,
+    )
+
+    reset_client()
+    ensure_collections()
+    tenant_a = "tenant-a"
+    tenant_b = "tenant-b"
+    vector_a = [0.05] * 1536
+    vector_b = [0.95] * 1536
+    vector_a[0] = 1.0
+    vector_b[1] = 1.0
+    upsert_resume_vector(tenant_a, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "user-a", vector_a)
+    upsert_resume_vector(tenant_b, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "user-b", vector_b)
+    hits = search_resumes(tenant_a, vector_b, limit=20)
+    payloads = [hit.payload or {} for hit in hits]
+    assert all(item.get("tenant_id") == tenant_a for item in payloads)
+    assert all(item.get("resume_id") != "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" for item in payloads)
+    own = search_resumes(tenant_a, vector_a, limit=5)
+    assert own and own[0].payload["resume_id"] == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"

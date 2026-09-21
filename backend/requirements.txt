@@ -16,6 +16,9 @@ langgraph==0.6.7
 slowapi==0.1.9
 celery[redis]==5.5.3
 stripe==12.5.1
+qdrant-client==1.14.3
+prometheus-fastapi-instrumentator==7.1.0
+sentry-sdk[fastapi]==2.19.2
 pytest==8.4.2
 pytest-asyncio==1.2.0
 httpx==0.28.1

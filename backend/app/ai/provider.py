@@ -114,25 +114,55 @@ def cosine_similarity(a, b):
     return sum(x * y for x, y in zip(a, b)) / norm if norm else 0.0
 
 
-async def match_resume(resume, job):
+async def embed_texts(texts):
+    client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=30)
+    result = await client.embeddings.create(model="text-embedding-3-small", input=texts)
+    return [item.embedding for item in result.data]
+
+
+async def match_resume(resume, job, tenant_id=None, resume_id=None, user_id=None):
     if settings.openai_api_key:
-        client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=30)
-        result = await client.embeddings.create(
-            model="text-embedding-3-small",
-            input=[
+        from app.ai.vectors import (
+            ensure_collections,
+            score_resume_against_job,
+            upsert_job_vector,
+            upsert_resume_vector,
+        )
+
+        resume_vector, job_vector = await embed_texts(
+            [
                 clean(json.dumps(resume)),
                 clean(job.description + " " + " ".join(job.required_skills)),
-            ],
+            ]
         )
+        if tenant_id and resume_id:
+            ensure_collections()
+            upsert_resume_vector(tenant_id, resume_id, user_id or "", resume_vector)
+            if getattr(job, "id", None):
+                upsert_job_vector(tenant_id, job.id, job_vector)
+            scored = score_resume_against_job(tenant_id, resume_id, job_vector)
+            if scored is not None:
+                return scored
         return round(
-            max(
-                0,
-                min(
-                    100, cosine_similarity(result.data[0].embedding, result.data[1].embedding) * 100
-                ),
-            ),
+            max(0, min(100, cosine_similarity(resume_vector, job_vector) * 100)),
             1,
         )
     skills = {s.lower() for s in resume.get("skills", [])}
     required = {s.lower() for s in job.required_skills}
     return round(100 * len(skills & required) / max(1, len(required)), 1)
+
+
+async def stream_chat_tokens(task, data):
+    client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=40, max_retries=1)
+    stream = await client.chat.completions.create(
+        model=settings.openai_model,
+        messages=[
+            {"role": "system", "content": SYSTEM + "\nTask: " + task},
+            {"role": "user", "content": json.dumps(data, default=str)[:24000]},
+        ],
+        stream=True,
+    )
+    async for event in stream:
+        piece = event.choices[0].delta.content or ""
+        if piece:
+            yield piece

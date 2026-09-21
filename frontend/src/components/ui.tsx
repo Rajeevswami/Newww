@@ -33,7 +33,15 @@ export function Badge({ children, status = '' }: { children?: ReactNode; status?
     </span>
   );
 }
-export function Match({ value }: { value: number }) {
+export function Match({ value }: { value: number | null }) {
+  if (value == null) {
+    return (
+      <span className="match fair">
+        <Sparkles size={12} />
+        Scoring…
+      </span>
+    );
+  }
   return (
     <span className={`match ${value >= 85 ? 'strong' : value >= 70 ? 'good' : 'fair'}`}>
       <Sparkles size={12} />
